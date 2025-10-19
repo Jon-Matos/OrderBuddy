@@ -3,11 +3,13 @@
 # - Fast TTS: streaming to file + immediate playback with ffplay when available
 # - Memory: uses memory_state.ConversationMemory for defaults & recent summary
 
-import os, time, queue, argparse, threading, json, re, shutil, tempfile, subprocess, sys
+import os, time, queue, argparse, uuid, threading, json, re, shutil, tempfile, subprocess, sys
 from typing import Optional, List, Dict, Any
 import sounddevice as sd  # 🎙 mic
 import soundfile as sf          # audio file read
 import requests  # HeyGen avatar bridge HTTP
+import random
+from datetime import datetime
 
 # === Avatar bridge toggles ===
 AVATAR_ENABLED = os.getenv("AVATAR_ENABLED", "1") == "1"
@@ -31,6 +33,95 @@ try:
     _client = OpenAI(base_url=API_BASE, api_key=API_KEY) if API_KEY else None
 except Exception:
     _client = None
+
+# Thread-safe writer so multiple runs won't collide
+_ORDERS_LOCK = threading.Lock()
+ORDERS_PATH = os.getenv("ORDERS_PATH", "orders.jsonl")  # change path via env if you want
+
+def _safe_get(obj, *names, default=None):
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+        if isinstance(obj, dict) and n in obj:
+            return obj[n]
+    return default
+
+def _cart_items_to_list(cart):
+    items = _safe_get(cart, "items", "line_items", default=[]) or []
+    out = []
+    for li in items:
+        out.append({
+            "qty":  _safe_get(li, "qty", "quantity", default=1),
+            "item": _safe_get(li, "name", "item", "title", default="item"),
+            "size": _safe_get(li, "size_or_variant", "size", "variant", default=None),
+            "mods": _safe_get(li, "modifiers", "mods", default=None),
+            "price_each": _safe_get(li, "price", "unit_price", default=None),
+            "uid":  _safe_get(li, "uid", "id", default=None),
+        })
+    return out
+
+def _cart_total(cart):
+    # Try common total fields/methods
+    for cand in ("total", "grand_total", "total_due", "compute_total", "totals"):
+        if hasattr(cart, cand):
+            val = getattr(cart, cand)
+            try:
+                v = val() if callable(val) else val
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, dict) and "total" in v and isinstance(v["total"], (int, float)):
+                    return float(v["total"])
+            except Exception:
+                pass
+    return None
+
+def place_order_to_jsonl(cart, meta=None):
+    """
+    Serialize the current cart and append to orders.jsonl (or ORDERS_PATH).
+    Returns the generated order_id.
+    """
+    order_id = str(uuid.uuid4())
+    doc = {
+        "order_id": order_id,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "items": _cart_items_to_list(cart),
+        "total": _cart_total(cart),
+        "meta": meta or {},  # you can pass user/session info here if you have it
+    }
+    line = json.dumps(doc, ensure_ascii=False)
+    with _ORDERS_LOCK:
+        with open(ORDERS_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    return order_id
+
+def casual(qs: list[str]) -> str:
+    """Pick a natural-sounding variant."""
+    return random.choice(qs)
+
+def ask_size_for(item_name: str) -> str:
+    return casual([
+        f"What size {item_name} would you like?",
+        f"Which size for the {item_name}?",
+        f"What size do you want for the {item_name}?",
+        f"What size should I make those {item_name}?",
+    ])
+
+def ask_multi_sizes(pending_items: list[str]) -> str:
+    # e.g., ["fries", "shake"]
+    if len(pending_items) == 1:
+        it = pending_items[0]
+        return casual([
+            f"Before I add that, what size {it} would you like?",
+            f"Got it—what size do you want for the {it}?",
+            f"Sure thing. Which size for the {it}?",
+        ])
+    # multiple items
+    nice = ", ".join(pending_items[:-1]) + f", and {pending_items[-1]}" if len(pending_items) > 1 else pending_items[0]
+    return casual([
+        f"Before I add those, what sizes would you like for the {nice}?",
+        f"Quick check—what sizes should I make the {nice}?",
+        f"Sounds good. Which sizes for the {nice}?",
+    ])
 
 def _as_openai_tools(tools): return tools
 
@@ -176,11 +267,27 @@ def _needs_size(item_name: str) -> bool:
     return False
 
 def parse_size(text: str) -> Optional[str]:
-    t = f" {text.lower()} "
-    if " small " in t or " sm " in t: return "sm"
-    if " medium " in t or " md " in t: return "md"
-    if " large " in t or " lg " in t: return "lg"
+    """
+    Map many ways of saying size -> 'sm' | 'md' | 'lg'
+    Accepts: small/sm/s/kid/kids/little, medium/med/md/regular/reg/m,
+             large/lg/l/big/xl/extra large
+    """
+    t = (text or "").lower()
+
+    # small
+    if re.search(r"\b(small|sm|s|kid|kids|little)\b", t):
+        return "sm"
+
+    # medium
+    if re.search(r"\b(medium|med|md|regular|reg|m)\b", t):
+        return "md"
+
+    # large
+    if re.search(r"\b(large|lg|l|big|xl|extra\s+large)\b", t):
+        return "lg"
+
     return None
+
 
 def extract_modifiers(text: str) -> List[str]:
     t = text.lower(); found = []
@@ -213,7 +320,7 @@ ACTION_WORDS = {
     "remove": {"remove","delete","drop","undo"},
     "readback": {"readback","total","summary","what's","whats","review"},
     "checkout": {
-        "that's it","that is it","that'll be it","that will be it",
+        "that'll be all", "that's it","that is it","that'll be it","that will be it",
         "i'm done","im done","i am done","no that's all","no thats all",
         "nope that's all","nope thats all","that's all","thats all",
         "place the order","complete the order","checkout","check out"
@@ -452,11 +559,27 @@ def main():
 
                 # Checkout (stop asking anything else)
                 if parsed.get("place_order"):
-                    final = f"Okay! Your total is ${cart.total():.2f}. Placing your order now."
-                    print(f"🤖 OrderBuddy: {final}")
-                    speak(final, voice=args.voice, output_device=args.output_device)
-                    mem.add_summary_bullet("Order placed.")
+                    # Persist the order to JSONL
+                    order_id = place_order_to_jsonl(cart, meta={"channel": "drive_thru", "assistant": "orderbuddy"})
+
+                    # Optional: clear the cart after placing
+                    try:
+                        if hasattr(cart, "clear") and callable(cart.clear):
+                            cart.clear()
+                    except Exception:
+                        pass
+
+                    # Log the ID silently, but don't say it to the guest
+                    print(f"🤖 OrderBuddy: order placed. id={order_id}")
+
+                    # Speak a short confirmation only
+                    msg = "All set — I’ve placed your order."
+                    print(f"🤖 OrderBuddy (to guest): {msg}")
+                    speak(msg, voice=args.voice, output_device=args.output_device)
+
+                    mem.add_summary_bullet(f"Order placed (ID {order_id[:8].upper()}).")
                     break
+
 
                 did_local = False
 
@@ -483,10 +606,9 @@ def main():
                         pending_adds.append({"it": it, "need_size": True})
 
                 if pending_adds:
-                    asks = []
-                    for pa in pending_adds:
-                        asks.append(f"{pa['it']['item']}: size (small/medium/large)")
-                    q = "Before I add those, could you confirm — " + "; ".join(asks) + "?"
+                    # collect the item labels needing a size (e.g., "fries", "coffee")
+                    need_labels = [pa['it']['item'] for pa in pending_adds]
+                    q = ask_multi_sizes(need_labels)
                     print(f"🤖 OrderBuddy: {q}")
                     speak(q, voice=args.voice, output_device=args.output_device)
                     PENDING.update({"active": True, "queue": pending_adds})
@@ -514,7 +636,11 @@ def main():
                             nm = pa["it"]["item"]; bits=[]
                             if pa["need_size"] and not size: bits.append("size (small/medium/large)")
                             asks.append(f"{pa['it'].get('qty',1)} {nm}: " + " & ".join(bits))
-                        q = "Thanks — just need: " + "; ".join(asks) + "."
+                        need_labels = [pa['it']['item'] for pa in unresolved]
+                        if len(need_labels) == 1:
+                            q = ask_size_for(need_labels[0])
+                        else:
+                            q = ask_multi_sizes(need_labels)
                         print(f"🤖 OrderBuddy: {q}")
                         speak(q, voice=args.voice, output_device=args.output_device)
                         PENDING["queue"] = unresolved
