@@ -26,23 +26,50 @@ function updateStatus(statusElement, message) {
   statusElement.innerHTML += message + '<br>';
   statusElement.scrollTop = statusElement.scrollHeight;
 }
+// window.addEventListener('DOMContentLoaded', startAvatarAuto());
+window.addEventListener('DOMContentLoaded', initializeApp); // Use a single entry point
 
-// const menuElement = document.querySelector('#menu');
-// function updateMenu(resp) {
-//   console.log(resp);
-//   if (!resp || !resp.menu || resp.menu.length === 0) {
-//     menuElement.innerHTML = '<i>No menu available</i>';
-//     return;
-//   }
+async function initializeApp() {
+    // 1. Setup UI Controls (Mute/Unmute)
+    setupUnmutePrompt(); 
 
-//   let html = '<ul>';
-//   resp.menu.forEach((item) => {
-//     html += `<li><b>${item.name}</b>: ${item.description} - <i>${item.price}</i></li>`;
-//   });
-//   html += '</ul>';
+    // 2. Start Avatar Session Automatically
+    await startAvatarAuto();
+}
 
-//   menuElement.innerHTML = html;
-// }
+async function startAvatarAuto() {
+  await createNewSession()
+  await startAndDisplaySession()
+}
+
+// --- NEW FUNCTION TO ENSURE ELEMENTS ARE FOUND ---
+function setupUnmutePrompt() {
+    // SELECTING ELEMENTS HERE GUARANTEES THEY ARE IN THE DOM
+    const unmutePrompt = document.querySelector('#unmute-prompt');
+    const unmuteBtn = document.querySelector('#unmuteBtn');
+
+    // Make sure the media element is selected
+    if (!mediaElement) {
+        console.error("Media element (#mediaElement) not found. Cannot mute.");
+        return;
+    }
+    
+    // Safety check that the button and prompt were found
+    if (!unmuteBtn || !unmutePrompt) {
+        console.error("Unmute prompt elements not found. Skipping listener setup.");
+        return;
+    }
+    
+    // Ensure video is muted initially (best practice)
+    mediaElement.muted = true; 
+
+    unmuteBtn.addEventListener('click', () => {
+        console.log("Unmute button clicked. Restoring audio.");
+        mediaElement.muted = false; // 1. Unmute the video
+        hideElement(unmutePrompt);  // 2. Hide the prompt modal
+    });
+}
+
 updateStatus(statusElement, 'Please click the new button to create the stream first.');
 
 function onMessage(event) {
@@ -58,7 +85,7 @@ async function createNewSession() {
   const voice = voiceID.value;
 
   // call the new interface to get the server's offer SDP and ICE server to create a new RTCPeerConnection
-  sessionInfo = await newSession('low', avatar, voice);
+  sessionInfo = await newSession('high', avatar, voice);
   const { sdp: serverSdp, ice_servers2: iceServers } = sessionInfo;
 
   // Create a new RTCPeerConnection
@@ -84,6 +111,8 @@ async function createNewSession() {
 
   updateStatus(statusElement, 'Session creation completed');
   updateStatus(statusElement, 'Now.You can click the start button to start the stream');
+
+  // startAndDisplaySession()
 }
 
 // Start session and display audio and video when clicking the "Start" button
@@ -422,8 +451,9 @@ async function closeConnectionHandler() {
   updateStatus(statusElement, 'Connection closed successfully');
 }
 
-document.querySelector('#newBtn').addEventListener('click', createNewSession);
-document.querySelector('#startBtn').addEventListener('click', startAndDisplaySession);
+// document.querySelector('#newBtn').addEventListener('click', createNewSession);
+
+// document.querySelector('#startBtn').addEventListener('click', startAndDisplaySession);
 document.querySelector('#repeatBtn').addEventListener('click', repeatHandler);
 document.querySelector('#closeBtn').addEventListener('click', closeConnectionHandler);
 document.querySelector('#talkBtn').addEventListener('click', talkHandler);
@@ -612,6 +642,8 @@ function renderCanvas() {
   renderID = curRenderID;
 
   const ctx = canvasElement.getContext('2d', { willReadFrequently: true });
+
+
 
   if (bgInput.value) {
     canvasElement.parentElement.style.background = bgInput.value?.trim();

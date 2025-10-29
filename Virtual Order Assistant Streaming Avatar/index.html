@@ -4,8 +4,15 @@
     <link rel="stylesheet" href="index.css" />
     <link rel="icon" href="./favicon.ico" />
   </head>
-
+  
   <body>
+    <div id="unmute-prompt" class="unmute-prompt">
+      <div class="prompt-content">
+          <p>🔊 The virtual assistant is muted for automatic start.</p>
+          <button id="unmuteBtn">Click Here to Unmute</button>
+      </div>
+    </div>
+    <br>
     <div class="main">
       <div class="actionRowsWrap">
         <div class="actionRow">
@@ -43,7 +50,7 @@
       </div>
       <div class="videoSectionWrap">
         <div class="videoWrap">
-          <video id="mediaElement" class="videoEle show" autoplay></video>
+          <video id="mediaElement" class="videoEle show" autoplay muted></video>
           <canvas id="canvasElement" class="videoEle hide"></canvas>
         </div>
 
@@ -69,7 +76,7 @@
       </div>
       
     </div>
-
+    
     <script type="module" src="index.js"></script>
   </body>
 </html>
