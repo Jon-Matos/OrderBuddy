@@ -1,97 +1,89 @@
+// server.js v8 — Adds /heyg/avatars list + proxy; keeps SSE bridge.
+// Run: npm i express cors dotenv node-fetch
+
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
-const multer = require('multer');
-const FormData = require('form-data');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+dotenv.config();
 
-// Use the global fetch and FormData provided by Node 18+ (no node-fetch/form-data require)
 const app = express();
+app.use(cors());
 app.use(express.json());
-
-// ensure uploads directory exists for multer
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
-
-// configure multer to store uploaded files in ./uploads
-const upload = multer({ dest: uploadsDir });
-
-const TRUSSED_LLM_URL = "https://fauengtrussed.fau.edu/provider/generic/chat/completions"
-const TRUSSED_STT_URL = "https://fauengtrussed.fau.edu/provider/generic/audio/transcriptions"
-const API_KEY = "2lIEsvI86eeCE8FtS09mnOp505iChe4SOQSwLOnUb0WDpbQ4";
-
-
-const systemSetup = "You are the Virtual Order Assistant, a friendly and efficient AI assistant for a fast food restaurant. You help customers place orders, answer questions about the menu, and provide information about promotions and deals. Always be polite and professional. If you don't know the answer to a question, admit it rather than making something up. Your goal is to provide accurate information and assist customers in placing their orders quickly and easily. You can also provide multilingual support if needed.";
-
 app.use(express.static(path.join(__dirname, '.')));
 
-app.post('/openai/complete', async (req, res) => {
+function heygenBase(){ return process.env.HEYGEN_SERVER_URL || 'https://api.heygen.com'; }
+function heygenKey(){ return process.env.HEYGEN_API_KEY || ''; }
+
+// /config for client
+app.get('/config', (_req, res) => {
+  res.json({
+    HEYGEN_SERVER_URL: heygenBase(),
+    HEYGEN_AVATAR: process.env.HEYGEN_AVATAR || '',
+    HEYGEN_VOICE: process.env.HEYGEN_VOICE || 'en_us_002',
+    HEYGEN_QUALITY: process.env.HEYGEN_QUALITY || 'low',
+  });
+});
+
+async function proxy(path, body) {
+  const base = heygenBase();
+  const key = heygenKey();
+  if (!key) throw new Error('HEYGEN_API_KEY missing');
+  const r = await fetch(base + path, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'X-Api-Key': key },
+    body: JSON.stringify(body || {}),
+  });
+  const txt = await r.text();
+  if (!r.ok) throw new Error(`HeyGen ${path} ${r.status}: ${txt}`);
+  return txt;
+}
+
+app.get('/heyg/avatars', async (_req, res) => {
   try {
-    const prompt = req.body.prompt;
-
-    const response = await fetch(TRUSSED_LLM_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o', 
-        messages: [
-          { role: 'system', content: systemSetup },
-          { role: 'user', content: prompt }
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      console.error("Trussed error:", await response.text());
-      return res.status(500).send("Error from Trussed endpoint");
-    }
-
-    const data = await response.json();
-    res.json({ text: data.choices[0].message.content });
-  } catch (error) {
-    console.error('Error calling Trussed:', error);
-    res.status(500).send('Error processing your request');
+    const r = await fetch(heygenBase() + '/v2/avatars', { headers: { 'X-Api-Key': heygenKey() }});
+    const txt = await r.text();
+    res.type('application/json').send(txt);
+  } catch(e) {
+    res.status(500).send(String(e.message || e));
   }
 });
 
-// === Speech-to-Text Endpoint ===
-app.post("/audio/transcriptions", upload.single("audio"), async (req, res) => {
-  try {
-    const audioPath = req.file.path;
-
-    // Use the `form-data` package so the file stream is sent as a proper upload
-    const form = new FormData();
-    form.append('file', fs.createReadStream(audioPath));
-    form.append('model', 'whisper-1'); // typical STT model name; confirm your Trussed options
-
-    const formHeaders = form.getHeaders();
-
-    const response = await fetch(TRUSSED_STT_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${API_KEY}`,
-        ...formHeaders,
-      },
-      body: form,
-    });
-
-    const data = await response.json();
-    fs.unlinkSync(audioPath); // clean up uploaded temp file
-
-    if (data.text) {
-      res.json({ text: data.text });
-    } else {
-      console.error("Transcription error:", data);
-      res.status(500).send("Error transcribing audio");
-    }
-  } catch (err) {
-    console.error("STT error:", err);
-    res.status(500).send("Speech-to-text failed");
-  }
+app.post('/heyg/streaming.new', async (req, res) => {
+  try { const out = await proxy('/v1/streaming.new', req.body); res.type('application/json').send(out); }
+  catch(e){ res.status(500).send(String(e.message || e)); }
+});
+app.post('/heyg/streaming.start', async (req, res) => {
+  try { const out = await proxy('/v1/streaming.start', req.body); res.type('application/json').send(out); }
+  catch(e){ res.status(500).send(String(e.message || e)); }
+});
+app.post('/heyg/streaming.ice', async (req, res) => {
+  try { const out = await proxy('/v1/streaming.ice', req.body); res.type('application/json').send(out); }
+  catch(e){ res.status(500).send(String(e.message || e)); }
+});
+app.post('/heyg/streaming.task', async (req, res) => {
+  try { const out = await proxy('/v1/streaming.task', req.body); res.type('application/json').send(out); }
+  catch(e){ res.status(500).send(String(e.message || e)); }
 });
 
-app.listen(3000, function () {
-  console.log('App is listening on port 3000!');
+// SSE for Python bridge
+const clients = new Set();
+app.get('/events', (req, res) => {
+  res.setHeader('Content-Type','text/event-stream');
+  res.setHeader('Cache-Control','no-cache');
+  res.setHeader('Connection','keep-alive');
+  res.flushHeaders();
+  res.write(`event: ready\ndata: ok\n\n`);
+  clients.add(res);
+  req.on('close', ()=>clients.delete(res));
+});
+function broadcast(event, payload){ const data = JSON.stringify(payload||{}); for (const r of clients){ try{ r.write(`event: ${event}\ndata: ${data}\n\n`);}catch{}} }
+app.post('/session/start', (_req,res)=>{ broadcast('session',{action:'start'}); res.json({ok:true}); });
+app.post('/speak', (req,res)=>{ const text=String(req.body?.text||'').trim(); if(!text) return res.status(400).json({error:'missing text'}); broadcast('speak',{text}); res.json({ok:true}); });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, ()=>{
+  console.log(`Bridge active on http://localhost:${PORT}`);
+  console.log('Using server-side HeyGen proxy + avatar auto-select.');
 });
