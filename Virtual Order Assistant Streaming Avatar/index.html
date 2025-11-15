@@ -1,70 +1,109 @@
 <!doctype html>
-<html>
-  <head>
-    <link rel="stylesheet" href="index.css" />
-    <link rel="icon" href="./favicon.ico" />
-  </head>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrderBuddy — Virtual Order Assistant</title>
+  <link rel="stylesheet" href="index.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>OrderBuddy — Virtual Order Assistant</h1>
+  </header>
 
-  <body>
-    <div class="main">
-      <div class="actionRowsWrap">
-        <div class="actionRow">
-          <label>
-            AvatarID
-            <input id="avatarID" type="text" />
-          </label>
-
-          <label>
-            VoiceID
-            <input id="voiceID" type="text" />
-          </label>
-
-          <button id="newBtn">New</button>
-          <button id="startBtn">Start</button>
-          <button id="closeBtn">Close</button>
-        </div>
-
-        <div class="actionRow">
-          <label>
-            Message
-            <input id="taskInput" type="text" />
-          </label>
-          <button id="repeatBtn">Repeat</button>
-          <button id="talkBtn">Talk</button>
-          <button id="recordBtn">Record Speech</button>
-
-        </div>
+  <main class="container">
+    <section class="left">
+      <div class="videoWrap">
+        <video id="mediaElement" autoplay playsinline></video>
       </div>
+      <div id="status" class="status" aria-live="polite"></div>
+      <div id="autoplayHint" class="hint hide">Click anywhere to enable audio…</div>
+    </section>
 
-      <p id="status"></p>
+    <section class="right">
+      <h2>Menu</h2>
+      <div id="menu"></div>
 
-      <div class="videoSectionWrap">
-        <div class="videoWrap">
-          <video id="mediaElement" class="videoEle show" autoplay></video>
-          <canvas id="canvasElement" class="videoEle hide"></canvas>
-        </div>
-
-        <div class="actionRow switchRow hide" id="bgCheckboxWrap">
-          <div class="switchWrap">
-            <span>Remove background</span>
-            <label class="switch">
-              <input type="checkbox" id="removeBGCheckbox" />
-              <span class="slider round"></span>
-            </label>
+      <!-- Current Order Panel (BRIGHT theme) -->
+      <aside id="ob-order-panel" aria-live="polite" aria-atomic="true">
+        <h3>Current Order</h3>
+        <ul id="ob-items">
+          <li class="ob-empty">Waiting for items…</li>
+        </ul>
+        <div class="ob-total">
+          <div class="ob-row"><span class="ob-dim">Subtotal</span>
+            <!-- Provide both ID conventions to be compatible with older JS -->
+            <span id="ob-subtotal"><span id="ob-sub">$0.00</span></span>
           </div>
-
-          <label>
-            Background (CSS)
-            <input
-              type="text"
-              id="bgInput"
-              value='url("https://app.heygen.com/icons/heygen/logo_hori_text_light_bg.svg") center / contain no-repeat'
-            />
-          </label>
+          <div class="ob-row"><span class="ob-dim">Tax</span>
+            <span id="ob-tax">$0.00</span>
+          </div>
+          <div class="ob-row ob-row-total">
+            <strong>Total</strong>
+            <strong id="ob-total"><span id="ob-tot">$0.00</span></strong>
+          </div>
         </div>
-      </div>
-    </div>
+      </aside>
+      <!-- /Current Order Panel -->
+    </section>
+  </main>
 
-    <script type="module" src="index.js"></script>
-  </body>
+  <footer class="footer">
+    <small>Virtual Order Assistant, Team G43, Fall 2025</small>
+  </footer>
+
+  <script src="index.js"></script>
+  <!-- SDK integration (OrderBuddy) is opt-in via ?sdk=1 -->
+  <script src="sdk_orderbuddy.js"></script>
+
+  <!-- Fallback/Universal updater for the Current Order panel -->
+  <script>
+  (function(){
+    // Allow overriding in index.js or elsewhere: window.OB_PANEL_URL = "http://<host>:<port>/state"
+    // To disable the panel fetch entirely, set: window.OB_PANEL_URL = false
+    if (window.OB_PANEL_URL === false) return;
+    const URL = (window.OB_PANEL_URL || "http://localhost:5055/state");
+    const ul = document.getElementById("ob-items");
+    const $ = (id) => document.getElementById(id);
+    const setMany = (ids, text) => ids.forEach(i => { const el = $(i); if (el) el.textContent = text; });
+    const fmt = (n) => (isFinite(n) ? "$" + Number(n).toFixed(2) : "$0.00");
+
+    async function tick(){
+      try{
+        const res = await fetch(URL, { cache: "no-store" });
+        if(!res.ok) throw new Error("Bad status: " + res.status);
+        const j = await res.json();
+
+        // Items
+        ul.innerHTML = "";
+        const items = (j.items || []);
+        if(!items.length){
+          ul.innerHTML = '<li class="ob-empty">Waiting for items…</li>';
+        }else{
+          for(const it of items){
+            const qty = (it.qty == null ? 1 : it.qty);
+            const name = [qty, (it.item||"").toString()].join(" × ");
+            const size = it.size ? `<span class="ob-size">${(String(it.size)).toUpperCase()}</span>` : "";
+            const mods = (Array.isArray(it.mods) && it.mods.length) ? `<div class="ob-mods">${it.mods.join(", ")}</div>` : "";
+            const price_each = (it.price_each != null) ? fmt(it.price_each) : "";
+            const li = document.createElement("li");
+            li.innerHTML = '<div class="ob-line"><div><div class="ob-name">'+name+' '+size+'</div>'+mods+'</div><div>'+price_each+'</div></div>';
+            ul.appendChild(li);
+          }
+        }
+
+        // Totals: support both id conventions
+        setMany(["ob-subtotal","ob-sub"], fmt(j.subtotal));
+        setMany(["ob-tax","ob_tax"], fmt(j.tax));
+        setMany(["ob-total","ob-tot"], fmt(j.total));
+      }catch(e){
+        // optional: console.warn("OB panel update failed:", e);
+      }finally{
+        setTimeout(tick, 400);
+      }
+    }
+    tick();
+  })();
+  </script>
+</body>
 </html>

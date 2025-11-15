@@ -1,0 +1,40 @@
+{
+  "Burgers": {
+    "Hamburger": 2.49,
+    "Cheeseburger": 2.99,
+    "Double Cheeseburger": 3.99,
+    "Big Mac": 5.49,
+    "Quarter Pounder": 5.19
+  },
+  "Sides": {
+    "Fries": {
+      "sm": 2.19,
+      "md": 2.49,
+      "lg": 2.79
+    }
+  },
+  "Shakes": {
+    "Chocolate Shake": {
+      "sm": 3.19,
+      "md": 3.69,
+      "lg": 4.19
+    },
+    "Vanilla Shake": {
+      "sm": 3.19,
+      "md": 3.69,
+      "lg": 4.19
+    },
+    "Strawberry Shake": {
+      "sm": 3.19,
+      "md": 3.69,
+      "lg": 4.19
+    }
+  },
+  "Drinks": {
+    "Soda": {
+      "sm": 1.49,
+      "md": 1.79,
+      "lg": 1.99
+    }
+  }
+}
