@@ -1,0 +1,27 @@
+def extract_selector(clause: str) -> dict:
+    t = clause.lower()
+    sel = {}
+    for k, v in ORDINAL_MAP.items():
+        if re.search(rf"\b{k}\b", t): sel["nth"] = v
+    if re.search(r"\b(all|both)\b", t): sel["all"] = True
+
+    # existing exact-name match
+    m = re.search(rf"\b{ITEM_PATTERN}\b", t)
+    if m: 
+        sel["item"] = m.group(0)
+
+    # NEW: fallbacks for singulars/aliases (e.g., "fry" → "fries")
+    if "item" not in sel:
+        if re.search(r"\bfry\b", t):
+            sel["item"] = "fries"
+
+    # keep existing UID and size logic
+    m2 = re.search(r"\[?(it\d+)\]?", t)
+    if m2: sel["uid"] = m2.group(1)
+
+    # already present in your file from earlier patch:
+    sz = parse_size(t)
+    if sz: sel["size_or_variant"] = sz
+    return sel
+
+

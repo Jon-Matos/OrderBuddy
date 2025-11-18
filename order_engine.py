@@ -85,6 +85,18 @@ class Cart:
             it = norm(where["item"])
             candidates = [i for i in candidates if i.item == it]
 
+        # NEW: optional size/variant filter
+        sz = where.get('size_or_variant') or where.get('size') or where.get('variant')
+        if sz:
+            candidates = [i for i in candidates if i.size_or_variant == sz]
+
+        # optional modifiers filter
+        try:
+            mods = where.get("mods") if isinstance(where, dict) else None
+        except Exception:
+            mods = None
+        if mods:
+            candidates = [i for i in candidates if all((m in (i.mods or [])) for m in mods)]
         if where.get("all"):
             return candidates
 
@@ -160,6 +172,41 @@ class Cart:
                 changed.append(li.label())
         return changed
 
+    
+    def remove(self, where: dict, qty: int | None = None) -> int:
+        """Remove items matching `where`. If qty is None: remove whole line(s).
+        If qty is provided: decrease quantity across matching lines, removing lines as needed.
+        Returns number of affected lines."""
+        targets = list(self.select(where))
+        affected = 0
+        if qty is None:
+            # remove all matching lines
+            for li in targets:
+                try:
+                    self.items.remove(li)
+                    affected += 1
+                except ValueError:
+                    pass
+            return affected
+        # decrement qty across matches (prefer most recent first)
+        try: qty_left = max(1, int(qty))
+        except Exception: qty_left = 1
+        for li in reversed(targets):
+            if qty_left <= 0: break
+            current = max(1, int(getattr(li, "qty", 1)))
+            if current <= qty_left:
+                try:
+                    self.items.remove(li)
+                    affected += 1
+                except ValueError:
+                    pass
+                qty_left -= current
+            else:
+                li.qty = current - qty_left
+                affected += 1
+                qty_left = 0
+        return affected
+
     def subtotal(self) -> float:
         return round(sum(i.line_total() for i in self.items), 2)
 
@@ -179,3 +226,35 @@ class Cart:
         if not self.items:
             return "Your cart is empty."
         return f"That will be ${self.total():.2f}. Would you like anything else?"
+    def needs_size_items(self):
+        """Return list of item names in cart that require a size but don't have one."""
+        out = []
+        for li in self.items[::-1]:
+            try:
+                opts = set(options_for(li.item))
+            except Exception:
+                opts = set()
+            if opts and not li.size_or_variant:
+                out.append(li.item)
+        return list(reversed(out))
+
+    def set_size_on_last_unset(self, size_code: str):
+        """Apply size to the most recent item that needs a size. Returns the item name if applied."""
+        if not size_code:
+            return None
+        for li in reversed(self.items):
+            try:
+                opts = set(options_for(li.item))
+            except Exception:
+                opts = set()
+            if not opts:
+                continue
+            if not li.size_or_variant and size_code in opts:
+                li.size_or_variant = size_code
+                try:
+                    li.price = pick_price(li.item, size_code)
+                except Exception:
+                    pass
+                return li.item
+        return None
+
