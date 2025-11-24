@@ -1,13 +1,18 @@
-# orderbuddy_talk_2.py — Voice ordering (fast-food), low-latency TTS, durable memory
+﻿# orderbuddy_talk_2.py — Voice ordering (fast-food), low-latency TTS, durable memory
 # - Live mic via sounddevice.InputStream
 # - Fast TTS: streaming to file + immediate playback with ffplay when available
 # - Memory: uses memory_state.ConversationMemory for defaults & recent summary
 
-import os, time, queue, argparse, uuid, threading, json, re, shutil, tempfile, subprocess, sys
+import os, time, queue, argparse, uuid, threading, json, re, shutil, tempfile, subprocess, sys, importlib, base64
 from typing import Optional, List, Dict, Any
 import sounddevice as sd  # 🎙 mic
 import soundfile as sf          # audio file read
 import random
+
+try:
+    import requests  # optional: used for HeyGen bridge calls
+except Exception:
+    requests = None
 from datetime import datetime
 
 # === Avatar bridge toggles ===
@@ -29,11 +34,18 @@ VOICE     = os.getenv("OB_VOICE",     "alloy")
 IGNORE_CHITCHAT = os.getenv("OB_IGNORE_CHITCHAT", "1") == "1"
 INTENT_DEBUG    = os.getenv("OB_INTENT_DEBUG", "0") == "1"
 
+OpenAI = None
+_client = None
 try:
-    from openai import OpenAI
-    _client = OpenAI(base_url=API_BASE, api_key=API_KEY) if API_KEY else None
+    _openai_mod = importlib.import_module("openai")
+    OpenAI = getattr(_openai_mod, "OpenAI", None)
 except Exception:
-    _client = None
+    OpenAI = None
+if OpenAI and API_KEY:
+    try:
+        _client = OpenAI(base_url=API_BASE, api_key=API_KEY)
+    except Exception:
+        _client = None
 
 try:
     from dynamo_db_rough import (
@@ -68,7 +80,7 @@ def _log_order(event_type: str, **kwargs):
 _ORDERS_LOCK = threading.Lock()
 ORDERS_PATH = os.getenv("ORDERS_PATH", "orders.jsonl")  # change path via env if you want
 
-def _safe_get(obj, *names, default=None):
+def _safe_get(obj: Any, *names: str, default: Any = None) -> Any:
     for n in names:
         if hasattr(obj, n):
             return getattr(obj, n)
@@ -266,27 +278,14 @@ def _ffplay_available() -> bool:
 def speak(text: str, voice: str = VOICE, out_path: str = "reply.wav", output_device: int | None = None):
     """
     Avatar-first speech:
-      1) Try HeyGen Node bridge (/session/start then /speak)
-      2) On failure or disabled: local TTS with winsound/sounddevice/ffplay (your original paths)
+      1) Send synthesized audio to the LiveAvatar bridge (repeatAudio for custom sessions).
+      2) On failure or disabled: play the audio locally (winsound/sounddevice/etc.).
     """
     text = (text or "").strip()
     if not text:
         return
     _log_voice("AssistantSpeech", llm_response=text)
 
-    # 1) HeyGen bridge
-    if AVATAR_ENABLED:
-        try:
-            requests.post(f"{AVATAR_BASE}/session/start", timeout=3)
-            r = requests.post(f"{AVATAR_BASE}/speak", json={"text": text}, timeout=10)
-            if r.ok:
-                return  # avatar will speak; skip local audio
-            else:
-                print(f"[Avatar warn] {r.status_code}: {r.text}")
-        except Exception as e:
-            print(f"[Avatar bridge unavailable → local TTS] {e}")
-
-    # 2) Local TTS (your original behavior)
     data = None
     if _client is None:
         print(f"[TTS stub] {text}")
@@ -310,12 +309,33 @@ def speak(text: str, voice: str = VOICE, out_path: str = "reply.wav", output_dev
         except Exception as e:
             print(f"[TTS warn] {e} | {text}")
 
-    if data:
+    if AVATAR_ENABLED and requests is not None:
         try:
-            with open(out_path, "wb") as f:
-                f.write(data)
+            payload = {"text": text}
+            if data:
+                try:
+                    payload["audio_b64"] = base64.b64encode(data).decode("ascii")
+                except Exception as enc_err:
+                    print(f"[Avatar warn] audio encode failed: {enc_err}")
+            requests.post(f"{AVATAR_BASE}/session/start", timeout=3)
+            r = requests.post(f"{AVATAR_BASE}/speak", json=payload, timeout=15)
+            if r.ok:
+                return
+            else:
+                print(f"[Avatar warn] {r.status_code}: {r.text}")
         except Exception as e:
-            print(f"[TTS file write error] {e}")
+            print(f"[Avatar bridge unavailable → local TTS] {e}")
+    elif AVATAR_ENABLED and requests is None:
+        print("[Avatar bridge unavailable → local TTS] missing 'requests' module")
+
+    if not data:
+        return
+
+    try:
+        with open(out_path, "wb") as f:
+            f.write(data)
+    except Exception as e:
+        print(f"[TTS file write error] {e}")
 
     try:
         import sys
@@ -328,7 +348,6 @@ def speak(text: str, voice: str = VOICE, out_path: str = "reply.wav", output_dev
         print(f"[TTS winsound fail] {e}")
 
     try:
-        # Try sounddevice (the path you had working before)
         data2, samplerate = sf.read(out_path, dtype="float32")
         sd.play(data2, samplerate, device=output_device)
         sd.wait()
@@ -355,6 +374,7 @@ def speak(text: str, voice: str = VOICE, out_path: str = "reply.wav", output_dev
         pass
 
     print(f"[TTS] saved {out_path} | {text}")
+
 
 # ----------------- Tiny durable memory wrapper -----------------
 # (You are already importing ConversationMemory from memory_state.py)
@@ -632,26 +652,49 @@ def nlu_to_commands(user_text: str) -> dict:
             mods = extract_modifiers(clause)
             cmds["adds"].append({"item": item, "qty": qty, "size_or_variant": size, "mods": mods})
     return cmds
-# Heuristic filter to decide if an utterance is order-related.
+
+# Intent filter (stricter) with debug toggle
 def is_order_related(text: str) -> bool:
     t = (text or "").lower().strip()
     if not t:
+        if INTENT_DEBUG:
+            print("[Intent] ignore: empty")
+        return False
+    # explicit non-order disclaimers
+    if (re.search(r"\b(?:not|don't|do not|isn't|is not|no)\b.*\border\b", t)
+        or re.search(r"\bnot (?:part|for|about) (?:of )?my order\b", t)
+        or re.search(r"\bnot ordering\b", t)
+        or re.search(r"\bignore this\b", t)):
+        if INTENT_DEBUG:
+            print("[Intent] ignore: explicit non-order disclaimer")
         return False
     parsed = nlu_to_commands(t)
-    if (
-        parsed.get("adds") or parsed.get("edits") or parsed.get("removes") or
-        parsed.get("remove_last") or parsed.get("readback") or parsed.get("place_order")
-    ):
+    if (parsed.get("adds") or parsed.get("edits") or parsed.get("removes")
+        or parsed.get("remove_last") or parsed.get("readback") or parsed.get("place_order")):
+        if INTENT_DEBUG:
+            print("[Intent] allow: local NLU command")
         return True
     if re.search(rf"\b{ITEM_PATTERN}\b", t):
+        if INTENT_DEBUG:
+            print("[Intent] allow: item mention")
         return True
     if parse_size(t):
+        if INTENT_DEBUG:
+            print("[Intent] allow: size word")
         return True
     if extract_modifiers(t):
+        if INTENT_DEBUG:
+            print("[Intent] allow: modifier")
         return True
-    if re.search(r"\b(order|get|add|include|i('m| am) done|that's it|thats it|checkout|check out|total|summary)\b", t):
+    if re.search(r"\b(checkout|check out|that(?:'|’)?s it|i(?:'|’)?m done|i am done|total|summary|readback)\b", t):
+        if INTENT_DEBUG:
+            print("[Intent] allow: keyword verb")
         return True
-    return False# ----------------- Tools (schema kept for LLM fallback) -----------------
+    if INTENT_DEBUG:
+        print(f"[Intent] ignore: '{t}'")
+    return False
+
+# ----------------- Tools (schema kept for LLM fallback) -----------------
 ADD_ITEMS_PARAMETERS = {
     "type": "object",
     "properties": {
@@ -704,13 +747,28 @@ def add_item_to_cart(cart: Cart, it: dict):
 
 # ----------------- STT helpers -----------------
 def _make_transcriber(args):
+    """
+    Instantiate Transcriber with whatever arguments this build supports.
+    Some versions only take model, others accept device/language.
+    """
+    model = getattr(args, "stt_model", None)
+    device = getattr(args, "device", None)
+    language = getattr(args, "lang", None)
+    first_kwargs = {}
+    if model is not None:
+        first_kwargs["model"] = model
+    if device is not None:
+        first_kwargs["device"] = device
+    if language is not None:
+        first_kwargs["language"] = language
     try:
-        return Transcriber(model=args.stt_model, device=args.device, language=args.lang)
+        return Transcriber(**first_kwargs)
     except TypeError:
-        try:
-            return Transcriber(args.stt_model)
-        except TypeError:
-            return Transcriber()
+        pass
+    try:
+        return Transcriber(model) if model is not None else Transcriber()
+    except TypeError:
+        return Transcriber()
 
 def _start_transcriber_if_needed(tr):
     try:
@@ -733,12 +791,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading as _threading
 ORDER_PANEL_PORT = int(os.getenv("ORDER_PANEL_PORT", "5055"))
 _CURRENT_STATE = {"items": [], "subtotal": 0.0, "tax": 0.0, "total": 0.0, "last_updated": None}
-
-def _safe_get(obj, *names, default=None):
-    for n in names:
-        if hasattr(obj, n): return getattr(obj, n)
-        if isinstance(obj, dict) and n in obj: return obj[n]
-    return default
 
 def _cart_items_to_list_panel(cart):
     try:
@@ -859,10 +911,10 @@ def main():
     ap.add_argument("--voice", default=VOICE)
     args = ap.parse_args()
 
-    mem = ConversationMemory(user_id="local-user")
-    cart = Cart()
     global SESSION_ID
     SESSION_ID = os.getenv("OB_SESSION_ID") or f"session-{uuid.uuid4()}"
+    mem = ConversationMemory(user_id="local-user")
+    cart = Cart(session_id=SESSION_ID)
     _log_voice("SessionStarted", llm_response="OrderBuddy session started.")
     try:
         _log_order("CartInitialized", total=cart.total())
@@ -872,7 +924,7 @@ def main():
     publish_panel_state(cart)
     convo = [{"role": "system", "content": base_system_prompt() + " " + mem.system_suffix()}]
 
-    stream_q: "queue.Queue[bytes]" = queue.Queue()
+    stream_q: "queue.Queue[Any]" = queue.Queue()
     stop = threading.Event()
 
     # 🎙️ Live mic -> queue
@@ -979,7 +1031,7 @@ def main():
                     except Exception:
                         pass
 
-                    cart = Cart()
+                    cart = Cart(session_id=SESSION_ID)
                     publish_panel_state(cart)
                     try:
                         _log_order("CartInitialized", total=cart.total())
@@ -1162,61 +1214,3 @@ if __name__ == "__main__":
             pass
     main()
 
-# Intent filter (stricter) with debug and env toggle
-def is_order_related(text: str) -> bool:
-    t = (text or "").lower().strip()
-    if not t:
-        try:
-            if INTENT_DEBUG: print("[Intent] ignore: empty")
-        except Exception:
-            pass
-        return False
-    # explicit non-order disclaimers
-    if re.search(r"\b(?:not|don't|do not|isn't|is not|no)\b.*\border\b", t) or re.search(r"\bnot (?:part|for|about) (?:of )?my order\b", t) or re.search(r"\bnot ordering\b", t) or re.search(r"\bignore this\b", t):
-        try:
-            if INTENT_DEBUG: print("[Intent] ignore: explicit non-order disclaimer")
-        except Exception:
-            pass
-        return False
-    parsed = nlu_to_commands(t)
-    if (parsed.get("adds") or parsed.get("edits") or parsed.get("removes") or
-        parsed.get("remove_last") or parsed.get("readback") or parsed.get("place_order")):
-        try:
-            if INTENT_DEBUG: print("[Intent] allow: local NLU command")
-        except Exception:
-            pass
-        return True
-    try:
-        import re
-        from re import search as _s
-    except Exception:
-        pass
-    if re.search(rf"\\b{ITEM_PATTERN}\\b", t):
-        try:
-            if INTENT_DEBUG: print("[Intent] allow: item mention")
-        except Exception:
-            pass
-        return True
-    if parse_size(t):
-        try:
-            if INTENT_DEBUG: print("[Intent] allow: size word")
-        except Exception:
-            pass
-        return True
-    if extract_modifiers(t):
-        try:
-            if INTENT_DEBUG: print("[Intent] allow: modifier")
-        except Exception:
-            pass
-        return True
-    if re.search(r"\b(checkout|check out|that(?:'')?s it|i(?:'')?m done|i am done|total|summary|readback)\b", t):
-        try:
-            if INTENT_DEBUG: print("[Intent] allow: keyword verb")
-        except Exception:
-            pass
-        return True
-    try:
-        if INTENT_DEBUG: print(f"[Intent] ignore: '{t}'")
-    except Exception:
-        pass
-    return False
