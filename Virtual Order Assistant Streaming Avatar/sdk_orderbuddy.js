@@ -1,6 +1,4 @@
-// sdk_orderbuddy.js — Integrate HeyGen SDK with OrderBuddy SSE bridge
-// SDK mode is default. Pass ?legacy=1 to use legacy path.
-
+// sdk_orderbuddy.js — LiveAvatar SDK bridge + OrderBuddy SSE glue
 (function(){
   const params = new URLSearchParams(location.search);
   if (params.get('legacy') === '1') return; // legacy explicitly requested
@@ -10,39 +8,49 @@
   const autoplayHint = document.getElementById('autoplayHint');
   function log(m){ if(statusEl){ statusEl.innerHTML += String(m) + '<br>'; statusEl.scrollTop = statusEl.scrollHeight; } }
 
-  let client = null;
   let session = null;
-  let lastReq = null;
+  let sessionState = 'INACTIVE';
   let hbTimer = null;
   let playTimer = null;
   let speakQueue = [];
   let draining = false;
   let readyToSpeak = false;
-  let firstDrainDone = false;
+  let unloadHookAttached = false;
+  let establishingPromise = null;
+  let eventStream = null;
 
   async function ensureSDK(){
-    try { return await import('https://esm.sh/@heygen/streaming-avatar@2?bundle'); }
-    catch(e1){ try{ return await import('/node_modules/@heygen/streaming-avatar/lib/index.esm.js'); }
-      catch(e2){ try{ return await import('https://unpkg.com/@heygen/streaming-avatar@2/lib/index.esm.js'); }
-        catch(e3){ log('SDK load failed'); throw e3; } } }
+    try { return await import('https://esm.sh/@heygen/liveavatar-web-sdk@0.0.9?bundle'); }
+    catch(e1){ try{ return await import('/node_modules/@heygen/liveavatar-web-sdk/dist/index.esm.js'); }
+      catch(e2){ try{ return await import('https://cdn.jsdelivr.net/npm/@heygen/liveavatar-web-sdk@0.0.9/dist/index.esm.js'); }
+        catch(e3){ log('LiveAvatar SDK load failed'); throw e3; } } }
   }
 
-  async function getJSON(url){ const r=await fetch(url,{cache:'no-store'}); if(!r.ok) throw new Error(url+': '+r.status); return r.json(); }
-
-  async function pickInteractiveAvatarId(){
-    try{ const r=await getJSON('/heyg/avatars'); const a=(r.data||[]).find(v=>v?.is_interactive||v?.isInteractive); return a?.avatar_id||''; }catch{ return ''; }
+  async function getJSON(url, opts){
+    const r = await fetch(url, { cache:'no-store', ...(opts||{}) });
+    if (!r.ok) throw new Error(url + ': ' + r.status);
+    return r.json();
   }
 
-  function startHeartbeat(){ stopHeartbeat(); hbTimer = setInterval(async()=>{ try{ if(client&&session) await client.keepAlive(); }catch{} }, 20000); }
-  function stopHeartbeat(){ if(hbTimer){ clearInterval(hbTimer); hbTimer=null; } }
+  function startHeartbeat(){
+    stopHeartbeat();
+    hbTimer = setInterval(async ()=>{
+      try{
+        if (session && sessionState === 'CONNECTED') await session.keepAlive();
+      }catch(e){
+        log('LiveAvatar keep-alive failed: ' + (e?.message||e));
+      }
+    }, 20000);
+  }
+  function stopHeartbeat(){ if (hbTimer){ clearInterval(hbTimer); hbTimer = null; } }
 
-  function ensurePlay(media){
-    if (!media) return;
-    const tryPlay = () => media.play().catch(()=>{});
+  function ensurePlay(el){
+    if (!el) return;
+    const tryPlay = () => el.play().catch(()=>{});
     tryPlay();
     if (playTimer) clearInterval(playTimer);
     playTimer = setInterval(()=>{
-      if (!media.paused && !media.ended && media.readyState >= 2) {
+      if (!el.paused && !el.ended && el.readyState >= 2){
         clearInterval(playTimer); playTimer = null; return;
       }
       tryPlay();
@@ -65,22 +73,22 @@
     });
   }
 
-  function canSpeak(){ return !!(client && session && readyToSpeak); }
+  function canSpeak(){ return !!(session && readyToSpeak && sessionState === 'CONNECTED'); }
 
-  async function sayOnce(text){
-    if (!text || !canSpeak()) return false;
+  function sayEntry(entry){
+    if (!entry || !canSpeak()) return false;
     try {
-      await client.speak({ text, taskType: 'repeat', taskMode: 'async' });
-      log('SDK: spoke.');
+      if (entry.audio_b64) {
+        session.repeatAudio(entry.audio_b64);
+      } else if (entry.text) {
+        session.repeat(entry.text);
+      } else {
+        return true;
+      }
+      log('LiveAvatar: queued speech.');
       return true;
     } catch (err) {
-      const msg = (String(err?.message||'') + ' ' + String(err?.responseText||'')).toLowerCase();
-      if (msg.includes('invalid session') || msg.includes('10002') || msg.includes('session is not in correct state')){
-        // Re-enqueue and let recovery happen
-        speakQueue.unshift(text);
-        return false;
-      }
-      log('SDK: speak failed: ' + (err?.message||err));
+      log('LiveAvatar speak failed: ' + (err?.message||err));
       return false;
     }
   }
@@ -89,94 +97,132 @@
     if (draining) return; draining = true;
     try {
       while (speakQueue.length && canSpeak()){
-        const text = speakQueue.shift();
-        const ok = await sayOnce(text);
-        if (!ok) break;
+        const entry = speakQueue.shift();
+        const ok = sayEntry(entry);
+        if (!ok){
+          speakQueue.unshift(entry);
+          break;
+        }
+        await new Promise(r=>setTimeout(r, 100));
       }
     } finally { draining = false; }
   }
 
-  async function attachHandlers(mod){
-    const StreamingAvatar = mod && (mod.default || mod.StreamingAvatar);
-    if (!StreamingAvatar) throw new Error('StreamingAvatar not found');
-    const cfg = await getJSON('/config');
-    const tk = await getJSON('/heyg/token').catch(()=>({token:''}));
-    const token = tk.token || '';
-    if (!token) { log('Missing token from /heyg/token'); return; }
+  async function shutdownSession(reason){
+    try {
+      stopHeartbeat();
+      if (session) await session.stop();
+    } catch {}
+    session = null;
+    readyToSpeak = false;
+    sessionState = 'INACTIVE';
+    if (reason) log('LiveAvatar session closed (' + reason + ').');
+  }
 
-    client = new StreamingAvatar({ token, basePath: cfg.HEYGEN_SERVER_URL || 'https://api.heygen.com' });
-
-    let avatarNameOrId = cfg.HEYGEN_AVATAR || '';
-    if (!avatarNameOrId) avatarNameOrId = await pickInteractiveAvatarId();
-    const voiceId = cfg.HEYGEN_VOICE || '';
-    const req = { quality: (cfg.HEYGEN_QUALITY || 'medium'), voice: voiceId ? { voiceId } : undefined };
-    if (avatarNameOrId) {
-      if (/^avtr_|^[0-9a-f]{8}-/.test(avatarNameOrId)) req.avatarId = avatarNameOrId; else req.avatarName = avatarNameOrId;
-    }
-    lastReq = req;
-
-    log('SDK: creating session…');
-    session = await client.createStartAvatar({ ...req, disableIdleTimeout: true, useSilencePrompt: false });
-    startHeartbeat();
-    // Ensure no default/demo prompt is speaking
-    try { await client.interrupt(); } catch {}
-
-    client.on && client.on('stream_ready', (ev)=>{
-      const stream = ev.detail; if(!stream) return;
-      media.srcObject = stream; media.muted=false;
-      ensurePlay(media);
-      media.play().catch(()=>{
-        autoplayHint?.classList.remove('hide');
-        const once=()=>{ media.play().catch(()=>{}); autoplayHint?.classList.add('hide'); document.removeEventListener('click', once, true);} ;
-        document.addEventListener('click', once, true);
-      });
-      const onPlaying = () => {
-        readyToSpeak = true;
-        setTimeout(()=>{ try{ drainQueue(); }catch(e){} }, 100);
-        media.removeEventListener('playing', onPlaying);
-      };
-      media.addEventListener('playing', onPlaying, { once: true });
-    });
-    // Nudge playback when speech begins
-    client.on && client.on('avatar_start_talking', ()=> { ensurePlay(media); drainQueue(); });
-    client.on && client.on('avatar_talking_message', ()=> { ensurePlay(media); drainQueue(); });
-    client.on && client.on('connection_quality_changed', ()=>{
-      if (!media.srcObject && client.mediaStream) { media.srcObject = client.mediaStream; ensurePlay(media); }
-    });
-    client.on && client.on('stream_disconnected', async ()=>{
-      log('SDK: stream disconnected; re-establishing…');
-      try { stopHeartbeat(); try{ await client.stopAvatar(); }catch{}; session = await client.createStartAvatar({ ...(lastReq||{}), useSilencePrompt: false }); startHeartbeat(); log('SDK: session re-established.'); drainQueue(); }
-      catch(e){ log('SDK: re-establish failed: '+(e.message||e)); }
-    });
-
-    // SSE bridge from Python: speak events
+  function ensureEventStream(){
+    if (eventStream) return;
     const es = new EventSource('/events');
+    eventStream = es;
     es.addEventListener('ready', ()=>log('Bridge ready.'));
     es.addEventListener('session', ()=>log('OrderBuddy: session start'));
-    es.addEventListener('speak', async (e)=>{
+    es.addEventListener('speak', (e)=>{
       try{
-        const { text } = JSON.parse(e.data||'{}');
-        if (!text) return;
-        speakQueue.push(text);
+        const payload = JSON.parse(e.data||'{}');
+        speakQueue.push({ text: payload?.text || '', audio_b64: payload?.audio_b64 || '' });
         drainQueue();
-      }catch{}
+      }catch(err){
+        console.warn('LiveAvatar SSE parse failed', err);
+      }
     });
+  }
 
-    log('SDK: connected. Use the Python app to drive speech.');
+  async function fetchSessionToken(){
+    const resp = await fetch('/liveavatar/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).catch((err)=>{ throw new Error('LiveAvatar session request failed: ' + (err?.message||err)); });
+    if (!resp.ok){
+      let errTxt = '';
+      try { errTxt = await resp.text(); } catch {}
+      throw new Error('LiveAvatar token failed: ' + (errTxt || resp.status));
+    }
+    return resp.json();
+  }
+
+  async function createSession(mod){
+    if (establishingPromise) return establishingPromise;
+    establishingPromise = (async ()=>{
+      const { LiveAvatarSession, SessionEvent } = mod;
+      readyToSpeak = false;
+      const cfg = await getJSON('/config');
+      const tokenPayload = await fetchSessionToken();
+      const token = tokenPayload.session_token || tokenPayload.token || '';
+      if (!token) throw new Error('Missing LiveAvatar session token');
+
+      const options = {
+        apiUrl: cfg.LIVEAVATAR_API_URL || cfg.HEYGEN_SERVER_URL || 'https://api.liveavatar.com',
+        voiceChat: false,
+      };
+      session = new LiveAvatarSession(token, options);
+      sessionState = session.state || 'INACTIVE';
+
+      session.on(SessionEvent.SESSION_STATE_CHANGED, (state)=>{
+        sessionState = state;
+        log('LiveAvatar state: ' + state);
+        if (state !== 'CONNECTED') readyToSpeak = false;
+      });
+      session.on(SessionEvent.SESSION_CONNECTION_QUALITY_CHANGED, (quality)=>{
+        log('LiveAvatar quality: ' + quality);
+      });
+      session.on(SessionEvent.SESSION_STREAM_READY, ()=>{
+        log('LiveAvatar: stream ready.');
+        if (!media) return;
+        try { session.attach(media); } catch (err) { log('Attach failed: ' + (err?.message||err)); }
+        media.muted = false;
+        ensurePlay(media);
+        media.play().catch(()=>{
+          autoplayHint?.classList.remove('hide');
+          const once=()=>{ media.play().catch(()=>{}); autoplayHint?.classList.add('hide'); document.removeEventListener('click', once, true);} ;
+          document.addEventListener('click', once, true);
+        });
+        waitForPlaying(media).then(()=>{
+          readyToSpeak = true;
+          setTimeout(()=>{ try{ drainQueue(); }catch{} }, 50);
+        });
+      });
+      session.on(SessionEvent.SESSION_DISCONNECTED, (reason)=>{
+        readyToSpeak = false;
+        stopHeartbeat();
+        log('LiveAvatar disconnected: ' + reason);
+        session = null;
+        setTimeout(()=>{ createSession(mod).catch(e=>log('LiveAvatar re-init failed: ' + (e?.message||e))); }, 4000);
+      });
+
+      await session.start();
+      log('LiveAvatar session started.');
+      startHeartbeat();
+    })().catch((err)=>{
+      log('LiveAvatar init failed: ' + (err?.message||err));
+      throw err;
+    }).finally(()=>{ establishingPromise = null; });
+    return establishingPromise;
   }
 
   document.addEventListener('DOMContentLoaded', async ()=>{
     try{
       const mod = await ensureSDK();
-      await attachHandlers(mod);
+      await createSession(mod);
+      ensureEventStream();
+      if (!unloadHookAttached){
+        unloadHookAttached = true;
+        window.addEventListener('beforeunload', ()=>{ shutdownSession('window closing'); });
+      }
+      log('LiveAvatar ready. Use the Python app to drive speech.');
     }catch(e){
       const base = e?.message || e;
-      const extra = e?.responseText || e?.data || e?.body || '';
-      log('SDK init failed: ' + base + (extra ? ' — ' + extra : ''));
+      log('SDK init failed: ' + base);
       if (typeof console !== 'undefined' && console.error) console.error(e);
     }
   });
 })();
-
-
-

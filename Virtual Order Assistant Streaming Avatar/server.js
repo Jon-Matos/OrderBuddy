@@ -1,4 +1,4 @@
-// server.js v8 — Adds /heyg/avatars list + proxy; keeps SSE bridge.
+﻿// server.js v8 â€” Adds /heyg/avatars list + proxy; keeps SSE bridge.
 // Run: npm i express cors dotenv node-fetch
 
 const express = require('express');
@@ -40,7 +40,7 @@ app.use((req,res,next)=>{
   next();
 });
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 app.use(express.static(path.join(__dirname, '.')));
 // Serve node_modules explicitly so scoped package paths resolve in the browser
 app.use('/node_modules', express.static(path.join(__dirname, 'node_modules')));
@@ -57,17 +57,33 @@ app.use((req,res,next)=>{
   next();
 });
 
-function heygenBase(){ return process.env.HEYGEN_SERVER_URL || 'https://api.heygen.com'; }
-function heygenKey(){ return process.env.HEYGEN_API_KEY || ''; }
-
-// /config for client
-app.get('/config', (_req, res) => {
-  res.json({
-    HEYGEN_SERVER_URL: heygenBase(),
-    HEYGEN_AVATAR: process.env.HEYGEN_AVATAR || '',
-    HEYGEN_VOICE: process.env.HEYGEN_VOICE || 'en_us_002',
-    HEYGEN_QUALITY: process.env.HEYGEN_QUALITY || 'low',
-  });
+function heygenBase(){ return process.env.HEYGEN_SERVER_URL || 'https://api.heygen.com'; }
+function heygenKey(){ return process.env.HEYGEN_API_KEY || ''; }
+function liveAvatarConfig(){
+  const mode = String(process.env.LIVEAVATAR_MODE || 'FULL').toUpperCase();
+  return {
+    apiKey: process.env.LIVEAVATAR_API_KEY || process.env.HEYGEN_API_KEY || '',
+    apiUrl: process.env.LIVEAVATAR_API_URL || process.env.HEYGEN_SERVER_URL || 'https://api.liveavatar.com',
+    avatarId: process.env.LIVEAVATAR_AVATAR_ID || process.env.HEYGEN_AVATAR || '',
+    voiceId: process.env.LIVEAVATAR_VOICE_ID || process.env.HEYGEN_VOICE || '',
+    contextId: process.env.LIVEAVATAR_CONTEXT_ID || '',
+    language: process.env.LIVEAVATAR_LANGUAGE || 'en',
+    mode,
+  };
+}
+
+// /config for client
+app.get('/config', (_req, res) => {
+  const live = liveAvatarConfig();
+  res.json({
+    HEYGEN_SERVER_URL: heygenBase(),
+    HEYGEN_AVATAR: process.env.HEYGEN_AVATAR || '',
+    HEYGEN_VOICE: process.env.HEYGEN_VOICE || 'en_us_002',
+    HEYGEN_QUALITY: process.env.HEYGEN_QUALITY || 'low',
+    LIVEAVATAR_API_URL: live.apiUrl,
+    LIVEAVATAR_MODE: live.mode,
+    LIVEAVATAR_AVATAR_ID: live.avatarId,
+  });
 });
 
 async function proxy(path, body, reqId) {
@@ -148,6 +164,57 @@ app.post('/heyg/streaming.close', async (req, res) => {
   catch(e){ replyError(res, e); }
 });
 
+
+// LiveAvatar session token helper (new SDK path)
+app.post('/liveavatar/session', async (req, res) => {
+  try {
+    const env = String(process.env.NODE_ENV || 'development').toLowerCase();
+    if (env === 'production') return res.status(403).json({ error: 'Disabled in production' });
+    const cfg = liveAvatarConfig();
+    const apiKey = cfg.apiKey;
+    if (!apiKey) return res.status(400).json({ error: 'LIVEAVATAR_API_KEY not configured' });
+    const apiUrl = (cfg.apiUrl || 'https://api.liveavatar.com').replace(/\/$/, '');
+    const mode = String(req.body?.mode || cfg.mode || 'FULL').toUpperCase();
+    const avatarId = String(req.body?.avatar_id || cfg.avatarId || '').trim();
+    if (!avatarId) return res.status(400).json({ error: 'LIVEAVATAR_AVATAR_ID not configured' });
+
+    const personaOverrides = req.body?.avatar_persona || {};
+    const persona = {
+      voice_id: personaOverrides.voice_id || cfg.voiceId,
+      context_id: personaOverrides.context_id || cfg.contextId,
+      language: personaOverrides.language || cfg.language,
+    };
+    const body = { mode, avatar_id: avatarId };
+    if (mode === 'FULL') {
+      const cleaned = {};
+      Object.entries(persona).forEach(([k, v]) => { if (v) cleaned[k] = v; });
+      if (Object.keys(cleaned).length) body.avatar_persona = cleaned;
+    }
+
+    pushLog('liveavatar_session_request', { id:req._id, mode, avatar_id: avatarId });
+    const resp = await fetchWithTimeout(`${apiUrl}/v1/sessions/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-API-KEY': apiKey },
+      body: JSON.stringify(body),
+    }, 15000);
+
+    const raw = await resp.text();
+    let payload = {};
+    try { payload = raw ? JSON.parse(raw) : {}; } catch {}
+    if (!resp.ok) {
+      const message = payload?.data?.[0]?.message || payload?.error || raw || 'Failed to create LiveAvatar session';
+      pushLog('liveavatar_session_error', { id:req._id, status: resp.status, error: message });
+      return res.status(resp.status).json({ error: message });
+    }
+
+    const data = payload?.data || {};
+    const token = data.session_token || '';
+    if (!token) return res.status(502).json({ error: 'Missing session_token from LiveAvatar response' });
+    res.json({ session_token: token, session_id: data.session_id || '', mode });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
 // SSE for Python bridge
 const clients = new Set();
 app.get('/events', (req, res) => {
@@ -161,7 +228,13 @@ app.get('/events', (req, res) => {
 });
 function broadcast(event, payload){ const data = JSON.stringify(payload||{}); for (const r of clients){ try{ r.write(`event: ${event}\ndata: ${data}\n\n`);}catch{}} }
 app.post('/session/start', (_req,res)=>{ broadcast('session',{action:'start'}); res.json({ok:true}); });
-app.post('/speak', (req,res)=>{ const text=String(req.body?.text||'').trim(); if(!text) return res.status(400).json({error:'missing text'}); broadcast('speak',{text}); res.json({ok:true}); });
+app.post('/speak', (req,res)=>{
+  const text = String(req.body?.text || '').trim();
+  const audio_b64 = req.body?.audio_b64;
+  if (!text && !audio_b64) return res.status(400).json({ error: 'missing text or audio' });
+  broadcast('speak', { text, audio_b64 });
+  res.json({ ok: true });
+});
 
 const PORT = process.env.PORT || 3000;
 // Simple health endpoint for sanity checks
@@ -202,7 +275,8 @@ app.get('/heyg/token', async (_req, res) => {
 });
 
 
-app.listen(PORT, ()=>{
-  console.log(`Bridge active on http://localhost:${PORT}`);
-  console.log('Using server-side HeyGen proxy + avatar auto-select.');
-});
+app.listen(PORT, ()=>{
+  console.log(`Bridge active on http://localhost:${PORT}`);
+  console.log('LiveAvatar bridge ready (legacy HeyGen proxy still exposed for compatibility).');
+});
+
