@@ -39,7 +39,9 @@ class LineItem:
         return round(self.price * max(self.qty, 1), 2)
 
 class Cart:
-    def __init__(self):
+    def __init__(self, session_id: str | None = None):
+        # session_id is optional; stored for logging/telemetry by callers.
+        self.session_id = session_id
         self.items: List[LineItem] = []
 
     def _validated_copy(self, li: LineItem) -> LineItem:

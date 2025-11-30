@@ -8,6 +8,8 @@ from typing import Optional, List, Dict, Any
 import sounddevice as sd  # 🎙 mic
 import soundfile as sf          # audio file read
 import random
+import shutil as _shutil
+import subprocess as _subprocess
 
 try:
     import requests  # optional: used for HeyGen bridge calls
@@ -30,9 +32,11 @@ API_BASE  = os.getenv("OB_API_BASE",  "https://fauengtrussed.fau.edu/provider/ge
 API_KEY   = os.getenv("OB_API_KEY",   os.getenv("OPENAI_API_KEY", ""))
 MODEL     = os.getenv("OB_MODEL",     "gpt-4o-mini")
 TTS_MODEL = os.getenv("OB_TTS_MODEL", "gpt-4o-mini-tts")
-VOICE     = os.getenv("OB_VOICE",     "alloy")
+VOICE     = os.getenv("OB_VOICE",     "onyx")
 IGNORE_CHITCHAT = os.getenv("OB_IGNORE_CHITCHAT", "1") == "1"
 INTENT_DEBUG    = os.getenv("OB_INTENT_DEBUG", "0") == "1"
+NO_LOCAL_TTS    = os.getenv("OB_NO_LOCAL_TTS", "0") == "1"  # if 1, suppress local playback fallback
+ALLOW_TEXT_FALLBACK = os.getenv("OB_ALLOW_TEXT_FALLBACK", "1") == "1"  # if 0, only send audio_b64 to avatar
 
 OpenAI = None
 _client = None
@@ -309,26 +313,68 @@ def speak(text: str, voice: str = VOICE, out_path: str = "reply.wav", output_dev
         except Exception as e:
             print(f"[TTS warn] {e} | {text}")
 
-    if AVATAR_ENABLED and requests is not None:
-        try:
-            payload = {"text": text}
-            if data:
+    # Optional tempo adjust (keeps pitch) before sending to avatar / local playback.
+    # Set OB_TTS_ATEMPO (e.g., 1.15) to speed up; valid range ~0.5-2.0.
+    try:
+        if data:
+            atempo = os.getenv("OB_TTS_ATEMPO")
+            if atempo:
                 try:
-                    payload["audio_b64"] = base64.b64encode(data).decode("ascii")
-                except Exception as enc_err:
-                    print(f"[Avatar warn] audio encode failed: {enc_err}")
-            requests.post(f"{AVATAR_BASE}/session/start", timeout=3)
-            r = requests.post(f"{AVATAR_BASE}/speak", json=payload, timeout=15)
-            if r.ok:
+                    rate = float(atempo)
+                except Exception:
+                    rate = None
+                if rate and 0.5 <= rate <= 2.0:
+                    # Local aliases keep static analyzers happy
+                    import shutil as _shutil
+                    import subprocess as _subprocess
+                    if _shutil.which("ffmpeg"):
+                        proc = _subprocess.run(
+                            ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", "pipe:0", "-filter:a", f"atempo={rate}", "-f", "wav", "pipe:1"],
+                            input=data, capture_output=True, check=False,
+                        )
+                        if proc.returncode == 0 and proc.stdout:
+                            data = proc.stdout
+                        else:
+                            err = (proc.stderr or b"").decode("utf-8", "ignore").strip()
+                            if err:
+                                print(f"[TTS atempo warn] ffmpeg failed: {err}")
+    except Exception as e:
+        print(f"[TTS atempo warn] {e}")
+
+    req = requests  # keep a local alias for type checkers
+    send_to_avatar = AVATAR_ENABLED and (req is not None) and (data or ALLOW_TEXT_FALLBACK)
+    if send_to_avatar:
+        if req is None:
+            # Should not happen due to guard above, but keeps type-checkers happy
+            if NO_LOCAL_TTS:
                 return
-            else:
-                print(f"[Avatar warn] {r.status_code}: {r.text}")
-        except Exception as e:
-            print(f"[Avatar bridge unavailable → local TTS] {e}")
+        else:
+            try:
+                payload = {"text": text}
+                if data:
+                    try:
+                        payload["audio_b64"] = base64.b64encode(data).decode("ascii")
+                    except Exception as enc_err:
+                        print(f"[Avatar warn] audio encode failed: {enc_err}")
+                req.post(f"{AVATAR_BASE}/session/start", timeout=3)
+                r = req.post(f"{AVATAR_BASE}/speak", json=payload, timeout=15)
+                if r.ok:
+                    return
+                else:
+                    print(f"[Avatar warn] {r.status_code}: {r.text}")
+            except Exception as e:
+                print(f"[Avatar bridge unavailable → local TTS] {e}")
+            if NO_LOCAL_TTS:
+                return
     elif AVATAR_ENABLED and requests is None:
         print("[Avatar bridge unavailable → local TTS] missing 'requests' module")
+        if NO_LOCAL_TTS:
+            return
 
     if not data:
+        return
+
+    if NO_LOCAL_TTS:
         return
 
     try:
@@ -493,6 +539,14 @@ def all_item_names() -> List[str]:
 
 ITEM_NAMES = all_item_names()
 ITEM_PATTERN = r"(?:%s)" % "|".join(re.escape(n) for n in ITEM_NAMES)
+def mentioned_items(text: str) -> list[str]:
+    """Return menu items mentioned in text (normalized)."""
+    t = (text or "").lower()
+    hits = []
+    for nm in ITEM_NAMES:
+        if re.search(rf"\b{re.escape(nm)}\b", t):
+            hits.append(nm)
+    return hits
 
 ACTION_WORDS = {
     "add": {"add","order","get","include","plus","i'll take","i would like","i want"},
@@ -1002,6 +1056,14 @@ def main():
 
                 # ---- Local NLU
                 parsed = nlu_to_commands(user_text)
+                # If we still need a size (fries/shake/soda/etc.) and the user is adding more items, acknowledge but keep asking for the missing size.
+                if PENDING["active"] and parsed.get("adds"):
+                    pending_labels = [pa["it"]["item"] for pa in PENDING["queue"]]
+                    if pending_labels:
+                        need_labels = ", ".join(pending_labels)
+                        q = f"Got it, but I still need a size for the {need_labels}. Small, medium, or large?"
+                        print(f"?? OrderBuddy: {q}")
+                        speak(q, voice=args.voice, output_device=args.output_device)
 
                 # Checkout (stop asking anything else)
                 if parsed.get("place_order"):
@@ -1112,6 +1174,16 @@ def main():
 
                 # Pending size resolution
                 if PENDING["active"]:
+                    pending_labels = [pa["it"]["item"] for pa in PENDING["queue"]]
+                    mentioned = mentioned_items(user_text)
+                    # If user is talking about other items while we still need size, re-ask and do not steal their size for old items.
+                    if mentioned and any(m not in pending_labels for m in mentioned):
+                        need_labels = ", ".join(pending_labels)
+                        q = f"Got it, but I still need a size for the {need_labels}. Small, medium, or large?"
+                        print(f"?? OrderBuddy: {q}")
+                        speak(q, voice=args.voice, output_device=args.output_device)
+                        continue
+
                     size = parse_size(user_text)
                     unresolved = []
                     for pa in PENDING["queue"]:
