@@ -67,6 +67,7 @@
     const $ = (id) => document.getElementById(id);
     const setMany = (ids, text) => ids.forEach(i => { const el = $(i); if (el) el.textContent = text; });
     const fmt = (n) => (isFinite(n) ? "$" + Number(n).toFixed(2) : "$0.00");
+    const titleCase = (s) => (s || "").toString().replace(/\b\w/g, c => c.toUpperCase());
 
     async function tick(){
       try{
@@ -82,7 +83,8 @@
         }else{
           for(const it of items){
             const qty = (it.qty == null ? 1 : it.qty);
-            const name = [qty, (it.item||"").toString()].join(" × ");
+            const label = titleCase(it.display || it.item || "");
+            const name = [qty, label].join(" × ");
             const size = it.size ? `<span class="ob-size">${(String(it.size)).toUpperCase()}</span>` : "";
             const mods = (Array.isArray(it.mods) && it.mods.length) ? `<div class="ob-mods">${it.mods.join(", ")}</div>` : "";
             const price_each = (it.price_each != null) ? fmt(it.price_each) : "";
